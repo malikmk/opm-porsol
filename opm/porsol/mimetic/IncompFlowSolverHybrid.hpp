@@ -44,31 +44,13 @@
 #include <boost/scoped_ptr.hpp>
 #include <boost/lexical_cast.hpp>
 
-#include <dune/common/fvector.hh>
-#include <dune/common/fmatrix.hh>
-#include <opm/core/utility/ErrorMacros.hpp>
-#include <opm/core/utility/SparseTable.hpp>
-
-#include <dune/istl/bvector.hh>
-#include <dune/istl/bcrsmatrix.hh>
-#include <dune/istl/operators.hh>
-#include <dune/istl/io.hh>
-
-#include <dune/istl/overlappingschwarz.hh>
-#include <dune/istl/schwarz.hh>
-#include <dune/istl/preconditioners.hh>
-#include <dune/istl/solvers.hh>
-#include <dune/istl/owneroverlapcopy.hh>
-#include <dune/istl/paamg/amg.hh>
-#include <dune/common/version.hh>
-#if DUNE_VERSION_NEWER(DUNE_ISTL, 2, 3)
-#include <dune/istl/paamg/fastamg.hh>
-#endif
-#include <dune/istl/paamg/kamg.hh>
-#include <dune/istl/paamg/pinfo.hh>
-
 #include <opm/porsol/common/BoundaryConditions.hpp>
 #include <opm/porsol/common/Matrix.hpp>
+
+#include <opm/core/linalg/petsc.hpp>
+#include <opm/core/linalg/petscsolver.hpp>
+#include <opm/core/linalg/petscmatrix.hpp>
+#include <opm/core/linalg/petscvector.hpp>
 
 #include <algorithm>
 #include <functional>
@@ -79,6 +61,8 @@
 #include <utility>
 #include <vector>
 #include <iostream>
+
+#include <ctime>
 
 namespace Opm {
     namespace {
@@ -436,7 +420,7 @@ namespace Opm {
 	    Opm::SparseTable< int  > cellFaces_;
             std::vector<Scalar> pressure_;
 	    Opm::SparseTable<Scalar> outflux_;
-	    
+
             void clear() {
                 std::vector<int>().swap(cellno_);
                 cellFaces_.clear();
@@ -480,6 +464,8 @@ namespace Opm {
                   const BCInterface&        bc)
         {
             clear();
+
+            MPI_Comm_rank( Petsc::Petsc::comm(), &this->mpi_rank );
 
             if (g.numberOfCells() > 0) {
                 initSystemStructure(g, bc);
@@ -535,12 +521,11 @@ namespace Opm {
                                  const BCInterface&   bc)
         {
             // You must call clear() prior to initSystemStructure()
-            assert (cleared_state_);
-
             assert  (topologyIsSane(g));
 
             enumerateDof(g, bc);
-            allocateConnections(bc);
+            this->S_ = allocateConnections(bc);
+
             setConnections(bc);
         }
 
@@ -646,7 +631,7 @@ namespace Opm {
         ///
         /// @param [in] linsolver_maxit maximum iterations allowed
         ///
-        /// @param [in] prolongate_factor Factor to scale the prolongated coarse 
+        /// @param [in] prolongate_factor Factor to scale the prolongated coarse
         ///    coarse grid correction
         ///
         /// @param [in] smooth_steps Number of smoothing steps to be
@@ -667,38 +652,30 @@ namespace Opm {
                    double prolongate_factor = 1.6,
                    int smooth_steps = 1)
         {
-            assembleDynamic(r, sat, bc, src);
-//             static int count = 0;
-//             ++count;
-//             printSystem(std::string("linsys_mimetic-") + boost::lexical_cast<std::string>(count));
-            switch (linsolver_type) {
-            case 0: // ILU0 preconditioned CG
-              solveLinearSystem(residual_tolerance, linsolver_verbosity, linsolver_maxit);
-                break;
-            case 1: // AMG preconditioned CG
-                solveLinearSystemAMG(residual_tolerance, linsolver_verbosity, 
-				     linsolver_maxit, prolongate_factor, same_matrix, smooth_steps);
-                break;
-		
-            case 2: // KAMG preconditioned CG
-                solveLinearSystemKAMG(residual_tolerance, linsolver_verbosity, 
-				      linsolver_maxit, prolongate_factor, same_matrix,smooth_steps);
-                break;
-            case 3: // CG preconditioned with AMG that uses less memory badwidth
-#if defined(HAS_DUNE_FAST_AMG) || DUNE_VERSION_NEWER(DUNE_ISTL, 2, 3)
-                solveLinearSystemFastAMG(residual_tolerance, linsolver_verbosity, 
-                             linsolver_maxit, prolongate_factor, same_matrix,smooth_steps);
-#else
-                if(linsolver_verbosity)
-                    std::cerr<<"Fast AMG is not available; falling back to CG preconditioned with the normal one."<<std::endl;
-                solveLinearSystemAMG(residual_tolerance, linsolver_verbosity, 
-				     linsolver_maxit, prolongate_factor, same_matrix, smooth_steps);
-#endif
-                break;
-            default:
-                std::cerr << "Unknown linsolver_type: " << linsolver_type << '\n';
-                throw std::runtime_error("Unknown linsolver_type");
-            }
+
+            clock_t start_assembly = clock();
+            auto A = assembleDynamic(r, sat, bc, src);
+
+            Petsc::Solver::Linear_tolerance ltol;
+            ltol.relative_tolerance = residual_tolerance;
+            ltol.absolute_tolerance = 1e-05;
+            ltol.maximum_iterations = linsolver_maxit > 0 ? linsolver_maxit : A.rows();
+
+
+            Petsc::Vector b( this->rhs_ );
+
+            auto x = Petsc::solve( A, b, ltol );
+
+            /*
+             * computePressureAndFluxes expects a std::vector, not a
+             * Petsc::Vector
+             */
+            Petsc::Vector::scalar* raw_arr;
+            VecGetArray( x, &raw_arr );
+            soln_.resize( x.size() );
+            soln_.insert( soln_.begin(), raw_arr, raw_arr + x.size() );
+            VecRestoreArray( x, &raw_arr );
+
             computePressureAndFluxes(r, sat);
         }
 
@@ -892,17 +869,17 @@ namespace Opm {
         ///    the matrix data is output to the file @code prefix +
         ///    "-mat.dat" @endcode while the right hand side data is
         ///    output to the file @code prefix + "-rhs.dat" @endcode.
-        void printSystem(const std::string& prefix)
-        {
-            writeMatrixToMatlab(S_, prefix + "-mat.dat");
+        //void printSystem(const std::string& prefix)
+        //{
+        //    writeMatrixToMatlab(S_, prefix + "-mat.dat");
 
-            std::string rhsfile(prefix + "-rhs.dat");
-            std::ofstream rhs(rhsfile.c_str());
-            rhs.precision(15);
-            rhs.setf(std::ios::scientific | std::ios::showpos);
-            std::copy(rhs_.begin(), rhs_.end(),
-                      std::ostream_iterator<VectorBlockType>(rhs, "\n"));
-        }
+        //    std::string rhsfile(prefix + "-rhs.dat");
+        //    std::ofstream rhs(rhsfile.c_str());
+        //    rhs.precision(15);
+        //    rhs.setf(std::ios::scientific | std::ios::showpos);
+        //    std::copy(rhs_.begin(), rhs_.end(),
+        //              std::ostream_iterator<VectorBlockType>(rhs, "\n"));
+        //}
 
     private:
         typedef std::pair<int,int>                 DofID;
@@ -927,12 +904,10 @@ namespace Opm {
 
         // ----------------------------------------------------------------
         // Actual, assembled system of linear equations
-        typedef Dune::FieldVector<Scalar, 1   > VectorBlockType;
-        typedef Dune::FieldMatrix<Scalar, 1, 1> MatrixBlockType;
 
-        Dune::BCRSMatrix <MatrixBlockType>      S_;    // System matrix
-        Dune::BlockVector<VectorBlockType>      rhs_;  // System RHS
-        Dune::BlockVector<VectorBlockType>      soln_; // System solution (contact pressure)
+        Petsc::Matrix::Builder::Inserter S_ = Petsc::Matrix::Builder::Inserter( 0, 0 );
+        std::vector< Petsc::Vector::scalar > soln_;
+        std::vector< Petsc::Vector::scalar > rhs_;
         bool                              matrix_structure_valid_;
         bool                              do_regularization_;
 
@@ -1112,55 +1087,30 @@ namespace Opm {
 
 
         // ----------------------------------------------------------------
-        void allocateConnections(const BCInterface& bc)
+        Petsc::Matrix::Builder::Inserter allocateConnections(const BCInterface& bc)
         // ----------------------------------------------------------------
         {
-            // You must call enumerateDof() prior to allocateConnections()
-            assert(!cleared_state_);
-
-            assert  (!matrix_structure_valid_);
-
-            // Clear any residual data, prepare for assembling structure.
-            S_.setSize(total_num_faces_, total_num_faces_);
-            S_.setBuildMode(Dune::BCRSMatrix<MatrixBlockType>::random);
-
-            // Compute row sizes
-            for (int f = 0; f < total_num_faces_; ++f) {
-                S_.setrowsize(f, 1);
-            }
-
-            allocateGridConnections();
-            allocateBCConnections(bc);
-
-            S_.endrowsizes();
-
             rhs_ .resize(total_num_faces_);
             soln_.resize(total_num_faces_);
+
+            return nonzero_pattern( bc );
         }
 
+        inline Petsc::Matrix::Builder::Inserter nonzero_pattern( const BCInterface& bc ) const {
 
-        // ----------------------------------------------------------------
-        void allocateGridConnections()
-        // ----------------------------------------------------------------
-        {
-            const   Opm::SparseTable<int>& cf = flowSolution_.cellFaces_;
-            typedef Opm::SparseTable<int>::row_type::const_iterator fi;
+            const auto& cf = flowSolution_.cellFaces_;
+            std::vector< Petsc::Matrix::size_type > nnz_per_row( this->total_num_faces_, 0 );
 
             for (int c = 0; c < cf.size(); ++c) {
                 const int nf = cf[c].size();
-                fi fb = cf[c].begin(), fe = cf[c].end();
+                auto fb = cf[c].begin(), fe = cf[c].end();
 
-                for (fi f = fb; f != fe; ++f) {
-                    S_.incrementrowsize(*f, nf - 1);
+                for( auto f = fb; f != fe; ++f) {
+                    nnz_per_row[*f ] += nf;
                 }
             }
-        }
 
 
-        // ----------------------------------------------------------------
-        void allocateBCConnections(const BCInterface& bc)
-        // ----------------------------------------------------------------
-        {
             // Include system connections for periodic boundary
             // conditions, if any.  We make an arbitrary choice in
             // that the face/degree-of-freedom with the minimum
@@ -1174,17 +1124,14 @@ namespace Opm {
             //
             // See also: setBCConnections() and addCellContrib().
             //
-            typedef typename GridInterface::CellIterator CI;
-            typedef typename CI           ::FaceIterator FI;
 
-            const std::vector<int>& cell = flowSolution_.cellno_;
-            const Opm::SparseTable<int>& cf   = flowSolution_.cellFaces_;
+            const auto& cell = flowSolution_.cellno_;
 
-            if (!bdry_id_map_.empty()) {
+            if (!bdry_id_map_.empty() ) {
                 // At least one periodic BC.  Allocate corresponding
                 // connections.
-                for (CI c = pgrid_->cellbegin(); c != pgrid_->cellend(); ++c) {
-                    for (FI f = c->facebegin(); f != c->faceend(); ++f) {
+                for (auto c = pgrid_->cellbegin(); c != pgrid_->cellend(); ++c) {
+                    for (auto f = c->facebegin(); f != c->faceend(); ++f) {
                         if (f->boundary() && bc.flowCond(*f).isPeriodic()) {
                             // dof-id of self
                             const int dof1 = cf[cell[c->index()]][f->localIndex()];
@@ -1201,20 +1148,23 @@ namespace Opm {
                                 // couplings.
                                 //
                                 const int ndof = cf.rowSize(c2);
-                                S_.incrementrowsize(dof1, ndof); // self->other
+                                nnz_per_row[ dof1 ] += ndof; // self->other
                                 for (int dof = 0; dof < ndof; ++dof) {
                                     int ii = cf[c2][dof];
                                     int pp = ppartner_dof_[ii];
                                     if ((pp != -1) && (pp != dof1) && (pp < ii)) {
-                                        S_.incrementrowsize(pp, 1);
+                                        nnz_per_row[ pp ] += 1;
                                     }
-                                    S_.incrementrowsize(ii, 1);  // other->self
+                                    nnz_per_row[ ii ] += 1;// other->self
                                 }
                             }
                         }
                     }
                 }
             }
+
+            return Petsc::Matrix::Builder::Inserter
+                ( this->total_num_faces_, this->total_num_faces_, nnz_per_row );
         }
 
 
@@ -1226,7 +1176,7 @@ namespace Opm {
             setGridConnections();
             setBCConnections(bc);
 
-            S_.endindices();
+            //S_.endindices();
 
             const int nc = pgrid_->numberOfCells();
             std::vector<Scalar>(nc).swap(flowSolution_.pressure_);
@@ -1250,7 +1200,7 @@ namespace Opm {
 
                 for (fi i = fb; i != fe; ++i) {
                     for (fi j = fb; j != fe; ++j) {
-                        S_.addindex(*i, *j);
+                        S_.insert(*i, *j);
                     }
                 }
             }
@@ -1306,10 +1256,10 @@ namespace Opm {
                                     if ((pp != -1) && (pp != dof1) && (pp < ii)) {
                                         ii = pp;
                                     }
-                                    S_.addindex(dof1, ii);  // self->other
-                                    S_.addindex(ii, dof1);  // other->self
-                                    S_.addindex(dof2, ii);
-                                    S_.addindex(ii, dof2);
+                                    S_.insert(dof1, ii);  // self->other
+                                    S_.insert(ii, dof1);  // other->self
+                                    S_.insert(dof2, ii);
+                                    S_.insert(ii, dof2);
                                 }
                             }
                         }
@@ -1322,12 +1272,15 @@ namespace Opm {
 
         // ----------------------------------------------------------------
         template<class FluidInterface>
-        void assembleDynamic(const FluidInterface&      fl ,
+        Petsc::Matrix assembleDynamic(const FluidInterface&      fl ,
                              const std::vector<double>& sat,
                              const BCInterface&         bc ,
                              const std::vector<double>& src)
         // ----------------------------------------------------------------
         {
+
+            Petsc::Matrix::Builder::Accumulator B = this->S_;
+
             typedef typename GridInterface::CellIterator CI;
 
             const std::vector<int>& cell = flowSolution_.cellno_;
@@ -1342,9 +1295,13 @@ namespace Opm {
             std::vector<Scalar>   condval   (max_ncf_);
             std::vector<int>      ppartner  (max_ncf_);
 
+
+            // Create a copy of the builder, which later serves as the actual
+            // matrix
+
             // Clear residual data
-            S_   = 0.0;
-            rhs_ = 0.0;
+            //S_   = 0.0;
+            rhs_.assign( rhs_.size(), 0.0 );
 
             std::fill(g_.begin(), g_.end(), Scalar(0.0));
             std::fill(L_.begin(), L_.end(), Scalar(0.0));
@@ -1377,296 +1334,24 @@ namespace Opm {
                 ImmutableFortranMatrix one(nf, 1, &e[0]);
                 buildCellContrib(c0, one, gflux, S, rhs);
 
-                addCellContrib(S, rhs, facetype, condval, ppartner, cf[c0]);
+                addCellContrib(S, rhs, facetype, condval, ppartner, cf[c0], B );
             }
+
+            if( do_regularization_ ) {
+                // mat[0][0] *= 2
+                auto mat = commit( std::move( B ) );
+                Petsc::Matrix::size_type rows[] = { 0 };
+                Petsc::Matrix::size_type cols[] = { 0 };
+                Petsc::Matrix::scalar vals[ 1 ];
+                MatGetValues( mat, 1, rows, 1, cols, vals );
+                MatSetValues( mat, 1, rows, 1, cols, vals, ADD_VALUES );
+                MatAssemblyBegin( mat, MAT_FINAL_ASSEMBLY );
+                MatAssemblyEnd( mat, MAT_FINAL_ASSEMBLY );
+                return mat;
+            }
+
+            return commit( std::move( B ) );
         }
-
-
-
-        // ----------------------------------------------------------------
-        void solveLinearSystem(double residual_tolerance, int verbosity_level, int maxit)
-        // ----------------------------------------------------------------
-        {
-            // Adapted from DuMux...
-            Scalar residTol = residual_tolerance;
-
-            typedef Dune::BCRSMatrix <MatrixBlockType>        Matrix;
-            typedef Dune::BlockVector<VectorBlockType>        Vector;
-            typedef Dune::MatrixAdapter<Matrix,Vector,Vector> Adapter;
-
-            // Regularize the matrix (only for pure Neumann problems...)
-            if (do_regularization_) {
-                S_[0][0] *= 2;
-            }
-            Adapter opS(S_);
-
-            // Construct preconditioner.
-            Dune::SeqILU0<Matrix,Vector,Vector> precond(S_, 1.0);
-
-            // Construct solver for system of linear equations.
-            Dune::CGSolver<Vector> linsolve(opS, precond, residTol,
-                                            (maxit>0)?maxit:S_.N(), verbosity_level);
-
-            Dune::InverseOperatorResult result;
-            soln_ = 0.0;
-
-            // Solve system of linear equations to recover
-            // face/contact pressure values (soln_).
-            linsolve.apply(soln_, rhs_, result);
-            if (!result.converged) {
-                OPM_THROW(std::runtime_error, "Linear solver failed to converge in " << result.iterations << " iterations.\n"
-                      << "Residual reduction achieved is " << result.reduction << '\n');
-            }
-        }
-
-
-
-        // ------------------ AMG typedefs --------------------
-
-        // Representation types for linear system.
-        typedef Dune::BCRSMatrix <MatrixBlockType>        Matrix;
-        typedef Dune::BlockVector<VectorBlockType>        Vector;
-        typedef Dune::MatrixAdapter<Matrix,Vector,Vector> Operator;
-
-        // AMG specific types.
-        // Old:   FIRST_DIAGONAL 1, SYMMETRIC 1, SMOOTHER_ILU 1, ANISOTROPIC_3D 0
-        // SPE10: FIRST_DIAGONAL 0, SYMMETRIC 1, SMOOTHER_ILU 0, ANISOTROPIC_3D 1
-#ifndef FIRST_DIAGONAL
-#define FIRST_DIAGONAL 1
-#endif
-#ifndef SYMMETRIC
-#define SYMMETRIC 1
-#endif
-#ifndef SMOOTHER_ILU
-#define SMOOTHER_ILU 1
-#endif
-#ifndef SMOOTHER_BGS
-#define SMOOTHER_BGS 0
-#endif
-#ifndef ANISOTROPIC_3D
-#define ANISOTROPIC_3D 0
-#endif
-
-#if FIRST_DIAGONAL
-        typedef Dune::Amg::FirstDiagonal CouplingMetric;
-#else
-        typedef Dune::Amg::RowSum        CouplingMetric;
-#endif
-
-#if SYMMETRIC
-        typedef Dune::Amg::SymmetricCriterion<Matrix,CouplingMetric>   CriterionBase;
-#else
-        typedef Dune::Amg::UnSymmetricCriterion<Matrix,CouplingMetric> CriterionBase;
-#endif
-
-#if SMOOTHER_BGS
-      typedef Dune::SeqOverlappingSchwarz<Matrix,Vector,Dune::MultiplicativeSchwarzMode> Smoother;
-#else
-#if SMOOTHER_ILU
-        typedef Dune::SeqILU0<Matrix,Vector,Vector>        Smoother;
-#else
-        typedef Dune::SeqSSOR<Matrix,Vector,Vector>        Smoother;
-#endif
-#endif
-        typedef Dune::Amg::CoarsenCriterion<CriterionBase> Criterion;
-
-
-        // --------- storing the AMG operator and preconditioner --------
-        boost::scoped_ptr<Operator> opS_;
-        typedef Dune::Preconditioner<Vector,Vector>   PrecondBase;
-        boost::scoped_ptr<PrecondBase> precond_;
-
-
-        // ----------------------------------------------------------------
-        void solveLinearSystemAMG(double residual_tolerance, int verbosity_level,
-                                  int maxit, double prolong_factor, bool same_matrix, int smooth_steps)
-        // ----------------------------------------------------------------
-        {
-            typedef Dune::Amg::AMG<Operator,Vector,Smoother,Dune::Amg::SequentialInformation>
-                Precond;
-
-            // Adapted from upscaling.cc by Arne Rekdal, 2009
-            Scalar residTol = residual_tolerance;
-
-            if (!same_matrix) {
-                // Regularize the matrix (only for pure Neumann problems...)
-                if (do_regularization_) {
-                    S_[0][0] *= 2;
-                }
-                opS_.reset(new Operator(S_));
-		
-                // Construct preconditioner.
-                double relax = 1;
-                typename Precond::SmootherArgs smootherArgs;
-                smootherArgs.relaxationFactor = relax;
-#if SMOOTHER_BGS
-                smootherArgs.overlap =  Precond::SmootherArgs::none;
-                smootherArgs.onthefly = false;
-#endif
-                Criterion criterion;
-                criterion.setDebugLevel(verbosity_level);
-#if ANISOTROPIC_3D
-                criterion.setDefaultValuesAnisotropic(3, 2);
-#endif
-                criterion.setProlongationDampingFactor(prolong_factor);
-                criterion.setBeta(1e-10);
-                precond_.reset(new Precond(*opS_, criterion, smootherArgs,
-				           1, smooth_steps, smooth_steps));
-            }
-            // Construct solver for system of linear equations.
-            Dune::CGSolver<Vector> linsolve(*opS_, dynamic_cast<Precond&>(*precond_), residTol, (maxit>0)?maxit:S_.N(), verbosity_level);
-
-            Dune::InverseOperatorResult result;
-            soln_ = 0.0;
-            // Adapt initial guess such Dirichlet boundary conditions are 
-            // represented, i.e. soln_i=A_{ii}^-1 rhs_i
-            typedef typename Dune::BCRSMatrix <MatrixBlockType>::ConstRowIterator RowIter;
-            typedef typename Dune::BCRSMatrix <MatrixBlockType>::ConstColIterator ColIter;
-            for(RowIter ri=S_.begin(); ri!=S_.end(); ++ri){
-                bool isDirichlet=true;
-                for(ColIter ci=ri->begin(); ci!=ri->end(); ++ci)
-                    if(ci.index()!=ri.index() && *ci!=0.0)
-                        isDirichlet=false;
-                if(isDirichlet)
-                    soln_[ri.index()]=rhs_[ri.index()]/S_[ri.index()][ri.index()];
-            }
-            // Solve system of linear equations to recover
-            // face/contact pressure values (soln_).
-            linsolve.apply(soln_, rhs_, result);
-            if (!result.converged) {
-                OPM_THROW(std::runtime_error, "Linear solver failed to converge in " << result.iterations << " iterations.\n"
-                      << "Residual reduction achieved is " << result.reduction << '\n');
-            }
-
-        }
-
-#if defined(HAS_DUNE_FAST_AMG) || DUNE_VERSION_NEWER(DUNE_ISTL, 2, 3)
-
-        // ----------------------------------------------------------------
-        void solveLinearSystemFastAMG(double residual_tolerance, int verbosity_level,
-                                  int maxit, double prolong_factor, bool same_matrix, int smooth_steps)
-        // ----------------------------------------------------------------
-        {
-            typedef Dune::Amg::FastAMG<Operator,Vector> Precond;
-
-            // Adapted from upscaling.cc by Arne Rekdal, 2009
-            Scalar residTol = residual_tolerance;
-
-            if (!same_matrix) {
-                // Regularize the matrix (only for pure Neumann problems...)
-                if (do_regularization_) {
-                    S_[0][0] *= 2;
-                }
-                opS_.reset(new Operator(S_));
-		
-                // Construct preconditioner.
-                typedef Dune::Amg::AggregationCriterion<Dune::Amg::SymmetricMatrixDependency<Matrix,CouplingMetric> > CriterionBase;
-
-                typedef Dune::Amg::CoarsenCriterion<CriterionBase> Criterion;
-                Criterion criterion;
-                criterion.setDebugLevel(verbosity_level);
-#if ANISOTROPIC_3D
-                criterion.setDefaultValuesAnisotropic(3, 2);
-#endif
-                criterion.setProlongationDampingFactor(prolong_factor);
-                criterion.setBeta(1e-10);
-                Dune::Amg::Parameters parms;
-                parms.setDebugLevel(verbosity_level);
-                parms.setNoPreSmoothSteps(smooth_steps);
-                parms.setNoPostSmoothSteps(smooth_steps);
-                precond_.reset(new Precond(*opS_, criterion, parms));
-            }
-            // Construct solver for system of linear equations.
-            Dune::GeneralizedPCGSolver<Vector> linsolve(*opS_, dynamic_cast<Precond&>(*precond_), residTol, (maxit>0)?maxit:S_.N(), verbosity_level);
-
-            Dune::InverseOperatorResult result;
-            soln_ = 0.0;
-
-            // Adapt initial guess such Dirichlet boundary conditions are 
-            // represented, i.e. soln_i=A_{ii}^-1 rhs_i
-            typedef typename Dune::BCRSMatrix <MatrixBlockType>::ConstRowIterator RowIter;
-            typedef typename Dune::BCRSMatrix <MatrixBlockType>::ConstColIterator ColIter;
-            for(RowIter ri=S_.begin(); ri!=S_.end(); ++ri){
-                bool isDirichlet=true;
-                for(ColIter ci=ri->begin(); ci!=ri->end(); ++ci)
-                    if(ci.index()!=ri.index() && *ci!=0.0)
-                        isDirichlet=false;
-                if(isDirichlet)
-                    soln_[ri.index()]=rhs_[ri.index()]/S_[ri.index()][ri.index()];
-            }
-            // Solve system of linear equations to recover
-            // face/contact pressure values (soln_).
-            linsolve.apply(soln_, rhs_, result);
-            if (!result.converged) {
-                OPM_THROW(std::runtime_error, "Linear solver failed to converge in " << result.iterations << " iterations.\n"
-                      << "Residual reduction achieved is " << result.reduction << '\n');
-            }
-
-        }
-#endif
-
-        // ----------------------------------------------------------------
-        void solveLinearSystemKAMG(double residual_tolerance, int verbosity_level,
-                                   int maxit, double prolong_factor, bool same_matrix, int smooth_steps)
-        // ----------------------------------------------------------------
-        {        
-            
-            typedef Dune::Amg::KAMG<Operator,Vector,Smoother,Dune::Amg::SequentialInformation,
-                              Dune::CGSolver<Vector> >   Precond;
-            // Adapted from upscaling.cc by Arne Rekdal, 2009
-            Scalar residTol = residual_tolerance;
-            if (!same_matrix) {
-                // Regularize the matrix (only for pure Neumann problems...)
-                if (do_regularization_) {
-                    S_[0][0] *= 2;
-                }
-                opS_.reset(new Operator(S_));
-                
-                // Construct preconditioner.
-                double relax = 1;
-                typename Precond::SmootherArgs smootherArgs;
-                smootherArgs.relaxationFactor = relax;
-#if SMOOTHER_BGS
-                smootherArgs.overlap =  Precond::SmootherArgs::none;
-                smootherArgs.onthefly = false;
-#endif
-                Criterion criterion;
-                criterion.setDebugLevel(verbosity_level);
-#if ANISOTROPIC_3D
-                criterion.setDefaultValuesAnisotropic(3, 2);
-#endif
-                criterion.setProlongationDampingFactor(prolong_factor);
-                criterion.setBeta(1e-10);
-                precond_.reset(new Precond(*opS_, criterion, smootherArgs, 2, smooth_steps, smooth_steps));
-            }
-            // Construct solver for system of linear equations.
-            Dune::CGSolver<Vector> linsolve(*opS_, dynamic_cast<Precond&>(*precond_), residTol, (maxit>0)?maxit:S_.N(), verbosity_level);
-
-            Dune::InverseOperatorResult result;
-            soln_ = 0.0;
-            // Adapt initial guess such Dirichlet boundary conditions are 
-            // represented, i.e. soln_i=A_{ii}^-1 rhs_i
-            typedef typename Dune::BCRSMatrix <MatrixBlockType>::ConstRowIterator RowIter;
-            typedef typename Dune::BCRSMatrix <MatrixBlockType>::ConstColIterator ColIter;
-            for(RowIter ri=S_.begin(); ri!=S_.end(); ++ri){
-                bool isDirichlet=true;
-                for(ColIter ci=ri->begin(); ci!=ri->end(); ++ci)
-                    if(ci.index()!=ri.index() && *ci!=0.0)
-                        isDirichlet=false;
-                if(isDirichlet)
-                    soln_[ri.index()]=rhs_[ri.index()]/S_[ri.index()][ri.index()];
-            }
-            // Solve system of linear equations to recover
-            // face/contact pressure values (soln_).
-            linsolve.apply(soln_, rhs_, result);
-            if (!result.converged) {
-                OPM_THROW(std::runtime_error, "Linear solver failed to converge in " << result.iterations << " iterations.\n"
-                      << "Residual reduction achieved is " << result.reduction << '\n');
-            }
-
-        }
-
-
 
         // ----------------------------------------------------------------
         template<class FluidInterface>
@@ -1820,7 +1505,8 @@ namespace Opm {
                             const std::vector<FaceType>& facetype,
                             const std::vector<Scalar>&   condval ,
                             const std::vector<int>&      ppartner,
-                            const L2G&                   l2g)
+                            const L2G&                   l2g,
+                            Petsc::Matrix::Builder::Accumulator& B)
         // ----------------------------------------------------------------
         {
             typedef typename L2G::const_iterator it;
@@ -1836,7 +1522,7 @@ namespace Opm {
                     // equation of the form: a*x = a*p where 'p' is
                     // the known pressure value (i.e., condval[r]).
                     //
-                    S_  [ii][ii] = S(r,r);
+                    B.add( ii, ii, S( r, r ) ); // S_[ii][ii] = S(r,r);
                     rhs_[ii]     = S(r,r) * condval[r];
                     continue;
                 case Periodic:
@@ -1859,13 +1545,13 @@ namespace Opm {
                         const double a = S(r,r), b = a * condval[r];
 
                         // Equation (1)
-                        S_  [         ii][         ii] += a;
-                        S_  [         ii][ppartner[r]] -= a;
+                        B.add( ii, ii, a );
+                        B.add( ii, ppartner[ r ], -a );
                         rhs_[         ii]              += b;
 
                         // Equation (2)
-                        S_  [ppartner[r]][         ii] -= a;
-                        S_  [ppartner[r]][ppartner[r]] += a;
+                        B.add( ppartner[ r ], ii, -a );
+                        B.add( ppartner[ r ], ppartner[ r ], a );
                         rhs_[ppartner[r]]              -= b;
                     }
 
@@ -1892,7 +1578,7 @@ namespace Opm {
                                 jj = ppartner[c];
                             }
                         }
-                        S_[ii][jj] += S(r,c);
+                        B.add( ii, jj, S( r, c ) );
                     }
                     break;
                 }

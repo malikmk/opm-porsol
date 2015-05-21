@@ -11,6 +11,7 @@ set (opm-porsol_DEPS
 	"C99"
 	# compile with C++0x/11 support if available
 	"CXX11Features"
+	"Petsc REQUIRED"
 	# various runtime library enhancements
 	"Boost 1.44.0
 		COMPONENTS date_time filesystem system iostreams unit_test_framework REQUIRED"
