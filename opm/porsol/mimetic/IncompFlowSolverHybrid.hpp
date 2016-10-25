@@ -364,7 +364,6 @@ namespace Opm {
               class BCInterface,
               template <class GridIF, class RockIF> class InnerProduct>
     class IncompFlowSolverHybrid {
-    	int mpi_rank;
         /// @brief
         ///    The element type of the matrix representation of the
         ///    mimetic inner product.  Assumed to be a floating point
