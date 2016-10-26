@@ -35,6 +35,10 @@ list (APPEND MAIN_SOURCE_FILES
 	opm/porsol/blackoil/fluid/MiscibilityLiveOil.cpp
 	opm/porsol/blackoil/fluid/MiscibilityProps.cpp
 	opm/porsol/common/LinearSolverISTL.cpp
+	opm/porsol/common/petsc.cpp
+	opm/porsol/common/petscmatrix.cpp
+	opm/porsol/common/petscsolver.cpp
+	opm/porsol/common/petscvector.cpp	
 	)
 
 # originally generated with the command:
@@ -116,6 +120,12 @@ list (APPEND PUBLIC_HEADER_FILES
 	opm/porsol/common/Matrix.hpp
 	opm/porsol/common/MatrixInverse.hpp
 	opm/porsol/common/PeriodicHelpers.hpp
+	opm/porsol/common/petsc.hpp
+	opm/porsol/common/petscmatrix.hpp
+	opm/porsol/common/petscmixins.hpp
+	opm/porsol/common/petscsolver.hpp
+	opm/porsol/common/petscsolver_impl.hpp
+	opm/porsol/common/petscvector.hpp
 	opm/porsol/common/ReservoirPropertyCapillaryAnisotropicRelperm.hpp
 	opm/porsol/common/ReservoirPropertyCapillaryAnisotropicRelperm_impl.hpp
 	opm/porsol/common/ReservoirPropertyCapillary.hpp
