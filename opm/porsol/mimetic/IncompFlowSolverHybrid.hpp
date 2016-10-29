@@ -51,6 +51,8 @@
 #include <opm/core/linalg/petscsolver.hpp>
 #include <opm/core/linalg/petscmatrix.hpp>
 #include <opm/core/linalg/petscvector.hpp>
+#include <opm/core/utility/SparseTable.hpp>
+
 
 #include <algorithm>
 #include <functional>
