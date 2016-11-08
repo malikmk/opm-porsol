@@ -511,7 +511,7 @@ void Matrix::Builder::at(
     const size_type cols[] = { col };
     const scalar vals[] = { value };
 
-    //MatSetOption(this->ptr, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE); 
+    MatSetOption(this->ptr(), MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE); 
 
 	auto err = MatSetValues( this->ptr(),
             1, rows,
